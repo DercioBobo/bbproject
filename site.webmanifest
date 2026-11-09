@@ -1,0 +1,21 @@
+{
+  "id": "./",
+  "lang": "pt-MZ",
+  "short_name": "BB Projectos",
+  "name": "BB Projectos — Custos e receitas por projecto",
+  "description": "Despesas, receitas e balanço final de cada projecto.",
+  "icons": [
+    { "src": "icon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any" },
+    { "src": "icon.png", "type": "image/png", "sizes": "192x192", "purpose": "any" },
+    { "src": "icon-512.png", "type": "image/png", "sizes": "512x512", "purpose": "any" },
+    { "src": "icon.png", "type": "image/png", "sizes": "192x192", "purpose": "maskable" },
+    { "src": "icon-512.png", "type": "image/png", "sizes": "512x512", "purpose": "maskable" }
+  ],
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f3d36",
+  "theme_color": "#0f3d36",
+  "categories": ["finance", "productivity"]
+}
