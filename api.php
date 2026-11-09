@@ -220,7 +220,7 @@ try {
         case 'push-test':
             requirePost($method);
             requireAuth();
-            $sent = pushToAll(['title' => 'Lembretes do BB Projectos activos', 'body' => 'Vai receber um aviso nos dias com pagamentos previstos.', 'url' => './']);
+            $sent = pushToAll(['title' => 'Lembretes do BB Projectos activos', 'body' => 'Vai receber um aviso nos dias com pagamentos ou actividades previstas.', 'url' => './']);
             respond(200, ['sent' => $sent]);
 
         default:

@@ -1,14 +1,17 @@
 <?php
 /**
- * BB Projectos — lembretes diários de pagamento.
+ * BB Projectos — lembretes diários de pagamentos e actividades.
  *
  * Correr de hora a hora no cPanel → Cron Jobs:
  *     0 * * * *  php /home/USER/public_html/bbproject/cron-reminders.php
  *
  * Uma vez por dia, à hora escolhida na aplicação (Definições → Lembretes), envia uma notificação a
- * cada dispositivo com os lembretes activos: as despesas previstas para hoje em projectos abertos
- * (e para amanhã, se "Também na véspera" estiver ligado), mais as notas marcadas para hoje.
+ * cada dispositivo com os lembretes activos: as despesas e actividades previstas para hoje em
+ * projectos abertos (e para amanhã, se "Também na véspera" estiver ligado). Uma actividade em atraso
+ * continua a ser lembrada todos os dias até ser marcada como feita ou mudar de data.
  * Nada previsto → nada enviado.
+ *
+ * Em cada hora, as actividades com hora marcada têm um aviso próprio, 30 a 90 minutos antes.
  *
  * Testar à mão:  php cron-reminders.php --now   (envia logo, ignora a hora)
  */
@@ -36,21 +39,51 @@ date_default_timezone_set($push['tz'] ?? 'Africa/Maputo');
 $today = date('Y-m-d');
 $hour = (int)($settings['remindHour'] ?? 8);
 
-if (!$force && ((int)date('G') < $hour || ($push['lastSent'] ?? '') === $today)) {
-    exit("Ainda não é hora (lembretes às {$hour}:00, último envio " . ($push['lastSent'] ?? 'nunca') . ").\n");
+[$pending, $activities] = openItems($data);
+$digestDue = $force || ((int)date('G') >= $hour && ($push['lastSent'] ?? '') !== $today);
+
+$alreadySent = $push['sentTimed'] ?? [];
+$soon = array_values(array_filter(timedDue($activities, time()), function ($n) use ($alreadySent) {
+    return !in_array(timedKey($n), $alreadySent, true);
+}));
+// O lembrete diário que sai agora já fala das actividades de hoje.
+$timed = $digestDue
+    ? array_values(array_filter($soon, function ($n) use ($today) { return $n['remind'] !== $today; }))
+    : $soon;
+if ($timed) {
+    $timedText = timedMessage($timed);
+    $sentTimed = pushToAll($timedText + ['url' => './', 'tag' => 'bbproject-hora-' . date('YmdH')]);
+    echo "Enviado para {$sentTimed} dispositivo(s): {$timedText['title']}\n";
+}
+if ($soon) {
+    withLock(function () use ($soon, $today) {
+        $store = pushStore();
+        $keys = array_merge($store['sentTimed'] ?? [], array_map('timedKey', $soon));
+        $store['sentTimed'] = array_values(array_filter($keys, function ($k) use ($today) { return substr($k, 0, 10) >= $today; }));
+        writeJson(PUSH_FILE, $store);
+    });
+}
+
+if (!$digestDue) {
+    exit("Ainda não é hora do lembrete diário (às {$hour}:00, último envio " . ($push['lastSent'] ?? 'nunca') . ").\n");
 }
 
 $tomorrow = date('Y-m-d', strtotime('+1 day'));
-[$pending, $allNotes] = openItems($data);
+$dayBefore = !empty($settings['remindDayBefore']);
 
 $due = array_values(array_filter($pending, function ($p) use ($today) { return $p['date'] === $today; }));
-$next = !empty($settings['remindDayBefore'])
+$next = $dayBefore
     ? array_values(array_filter($pending, function ($p) use ($tomorrow) { return $p['date'] === $tomorrow; }))
     : [];
 $earlier = array_values(array_filter($pending, function ($p) use ($today) { return $p['date'] < $today; }));
-$notes = array_values(array_filter($allNotes, function ($n) use ($today) { return ($n['remind'] ?? '') === $today; }));
 
-$message = reminderMessage($due, $next, $earlier, $notes, $settings);
+$todo = array_values(array_filter($activities, function ($n) use ($today) { return $n['remind'] === $today; }));
+$todoNext = $dayBefore
+    ? array_values(array_filter($activities, function ($n) use ($tomorrow) { return $n['remind'] === $tomorrow; }))
+    : [];
+$todoLate = array_values(array_filter($activities, function ($n) use ($today) { return $n['remind'] < $today; }));
+
+$message = reminderMessage($due, $next, $earlier, $todo, $todoNext, $todoLate, $settings);
 $sent = $message ? pushToAll($message + ['url' => './', 'tag' => 'bbproject-' . $today]) : 0;
 
 withLock(function () use ($today) {
@@ -63,7 +96,7 @@ echo $message ? "Enviado para {$sent} dispositivo(s): {$message['title']}\n" : "
 
 /* ---------------------------------------------------------------------- */
 
-/** Despesas por pagar e notas por concluir, de todos os projectos abertos. */
+/** Despesas por pagar e actividades com data por fazer, de todos os projectos abertos. */
 function openItems(array $data): array
 {
     $items = [];
@@ -83,7 +116,7 @@ function openItems(array $data): array
             }
         }
         foreach ($p['notes'] ?? [] as $n) {
-            if (empty($n['done'])) {
+            if (empty($n['done']) && !empty($n['remind'])) {
                 $notes[] = $n + ['project' => $p['name']];
             }
         }
@@ -92,9 +125,45 @@ function openItems(array $data): array
     return [$items, $notes];
 }
 
-function reminderMessage(array $due, array $next, array $earlier, array $notes, array $settings): ?array
+/**
+ * Actividades com hora que cabem nesta ronda: de meia hora a hora e meia depois do início da hora actual.
+ * Cada hora do dia cai em exactamente uma ronda, mesmo que o cron arranque uns minutos atrasado.
+ */
+function timedDue(array $activities, int $now): array
 {
-    if (!$due && !$next && !$notes) {
+    $from = strtotime(date('Y-m-d H:00:00', $now)) + 1800;
+    $until = $from + 3600;
+    $soon = array_values(array_filter($activities, function ($n) use ($from, $until) {
+        if (!preg_match('/^\d{2}:\d{2}$/', (string)($n['time'] ?? ''))) {
+            return false;
+        }
+        $at = strtotime($n['remind'] . ' ' . $n['time'] . ':00');
+        return $at >= $from && $at < $until;
+    }));
+    usort($soon, function ($a, $b) { return strcmp($a['remind'] . $a['time'], $b['remind'] . $b['time']); });
+    return $soon;
+}
+
+/** Identifica um aviso já enviado; começa pela data para se poder limpar os antigos. */
+function timedKey(array $n): string
+{
+    return $n['remind'] . ' ' . $n['time'] . ' ' . ($n['id'] ?? $n['title']);
+}
+
+function timedMessage(array $items): array
+{
+    if (count($items) === 1) {
+        $n = $items[0];
+        $detail = trim(explode("\n", (string)($n['text'] ?? ''))[0]);
+        return ['title' => 'Às ' . $n['time'] . ': ' . $n['title'], 'body' => implode(' · ', array_filter([$n['project'], $detail]))];
+    }
+    $lines = array_map(function ($n) { return $n['time'] . ' ' . $n['title'] . ' (' . $n['project'] . ')'; }, $items);
+    return ['title' => count($items) . ' actividades em breve', 'body' => implode("\n", $lines)];
+}
+
+function reminderMessage(array $due, array $next, array $earlier, array $todo, array $todoNext, array $todoLate, array $settings): ?array
+{
+    if (!$due && !$next && !$todo && !$todoNext && !$todoLate) {
         return null;
     }
     $money = function (float $n) use ($settings): string {
@@ -111,34 +180,64 @@ function reminderMessage(array $due, array $next, array $earlier, array $notes, 
         return $lines;
     };
     $total = function (array $items): float { return array_sum(array_column($items, 'amount')); };
+    // Uma actividade sozinha mostra o projecto e os detalhes; várias, uma linha cada.
+    $tasks = function (array $items): array {
+        $lines = array_map(function ($n) use ($items) {
+            if (count($items) === 1) {
+                return implode(' · ', array_filter([$n['project'], trim(explode("\n", (string)($n['text'] ?? ''))[0])]));
+            }
+            return $n['project'] . ': ' . (!empty($n['time']) ? $n['time'] . ' ' : '') . $n['title'];
+        }, array_slice($items, 0, 4));
+        if (count($items) > 4) {
+            $lines[] = 'e mais ' . (count($items) - 4);
+        }
+        return $lines;
+    };
+    $titles = function (array $items): string {
+        return implode(', ', array_map(function ($n) {
+            return (!empty($n['time']) ? $n['time'] . ' ' : '') . $n['title'];
+        }, array_slice($items, 0, 3))) . (count($items) > 3 ? '…' : '');
+    };
+    $at = function (string $day, array $n): string {
+        return $day . (!empty($n['time']) ? ' às ' . $n['time'] : '') . ': ' . $n['title'];
+    };
+    $activityCount = function (int $n): string { return $n === 1 ? '1 actividade' : $n . ' actividades'; };
 
     if ($due) {
         $title = count($due) === 1
             ? 'Pagar hoje: ' . $due[0]['name']
             : count($due) . ' pagamentos previstos hoje · ' . $money($total($due));
         $lines = count($due) === 1 ? [$due[0]['project'] . ' · ' . $money($due[0]['amount'])] : $list($due, 4);
+    } elseif ($todo) {
+        $title = count($todo) === 1 ? $at('Hoje', $todo[0]) : $activityCount(count($todo)) . ' para hoje';
+        $lines = $tasks($todo);
+        $todo = [];
     } elseif ($next) {
         $title = 'Amanhã: ' . (count($next) === 1 ? $next[0]['name'] : count($next) . ' pagamentos previstos');
         $lines = count($next) === 1 ? [$next[0]['project'] . ' · ' . $money($next[0]['amount'])] : $list($next, 4);
+    } elseif ($todoNext) {
+        $title = count($todoNext) === 1 ? $at('Amanhã', $todoNext[0]) : $activityCount(count($todoNext)) . ' para amanhã';
+        $lines = $tasks($todoNext);
+        $todoNext = [];
     } else {
-        $title = count($notes) === 1 ? 'Nota: ' . $notes[0]['title'] : count($notes) . ' notas para hoje';
-        $lines = array_map(function ($n) use ($notes) {
-            $text = trim(explode("\n", (string)($n['text'] ?? ''))[0]);
-            if (count($notes) === 1) {
-                return implode(' · ', array_filter([$n['project'], $text]));
-            }
-            return $n['project'] . ': ' . $n['title'];
-        }, array_slice($notes, 0, 4));
-        $notes = [];
+        $title = count($todoLate) === 1 ? 'Em atraso: ' . $todoLate[0]['title'] : $activityCount(count($todoLate)) . ' em atraso';
+        $lines = $tasks($todoLate);
+        $todoLate = [];
     }
     if ($due && $next) {
         $lines[] = 'Amanhã: ' . implode(', ', array_column(array_slice($next, 0, 3), 'name')) . (count($next) > 3 ? '…' : '');
     }
     if ($earlier) {
-        $lines[] = count($earlier) . ' em atraso';
+        $lines[] = (count($earlier) === 1 ? '1 pagamento' : count($earlier) . ' pagamentos') . ' em atraso';
     }
-    if ($notes) {
-        $lines[] = 'Notas: ' . implode(', ', array_column(array_slice($notes, 0, 3), 'title')) . (count($notes) > 3 ? '…' : '');
+    if ($todo) {
+        $lines[] = 'Hoje: ' . $titles($todo);
+    }
+    if ($todoNext) {
+        $lines[] = 'Amanhã: ' . $titles($todoNext);
+    }
+    if ($todoLate) {
+        $lines[] = $activityCount(count($todoLate)) . ' em atraso';
     }
     return ['title' => $title, 'body' => implode("\n", $lines)];
 }

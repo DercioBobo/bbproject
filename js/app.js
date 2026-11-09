@@ -179,7 +179,7 @@ function normalize(d) {
       estCost: 0, earnings: false, estEarnings: 0, earnDate: null, created: 0, ...p,
       categories: Array.isArray(p.categories) ? p.categories : [],
       entries: Array.isArray(p.entries) ? p.entries : [],
-      notes: (Array.isArray(p.notes) ? p.notes : []).map(n => ({ text: '', remind: null, done: false, ...n })),
+      notes: (Array.isArray(p.notes) ? p.notes : []).map(n => ({ text: '', remind: null, time: null, done: false, ...n })),
     })),
   };
 }
@@ -335,7 +335,7 @@ async function refresh() {
   updateSync();
 }
 
-/* ---------- lembretes de pagamento (Web Push, enviados pelo cron-reminders.php) ---------- */
+/* ---------- lembretes de pagamentos e actividades (Web Push, enviados pelo cron-reminders.php) ---------- */
 
 const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window && window.isSecureContext;
 
@@ -421,18 +421,18 @@ function remindersCard() {
   let action = '';
   if (S.push === 'off') action = `<button class="btn btn-primary" data-action="push-on">${ic('bell', 18)} Activar lembretes</button>`;
   if (S.push === 'on') action = `<button class="btn" data-action="push-test">${ic('bell', 18)} Enviar teste</button><button class="btn btn-ghost" data-action="push-off">Desactivar</button>`;
-  let note = 'Uma notificação nos dias em que há pagamentos previstos, com o projecto, o quê e quanto.';
+  let note = 'Uma notificação nos dias em que há pagamentos ou actividades previstas, com o projecto e o que há a fazer.';
   if (S.push === 'denied') note = 'As notificações estão bloqueadas para esta aplicação. Permita-as nas definições do telemóvel ou do navegador e volte aqui.';
   if (S.push === 'unsupported') note = isIOS()
     ? 'No iPhone, adicione primeiro o BB Projectos ao ecrã principal (Partilhar → Adicionar ao ecrã principal) e abra-o a partir daí. Requer iOS 16.4 ou mais recente.'
     : 'Este navegador não recebe notificações. Abra o BB Projectos em https no Chrome, Edge, Firefox ou Safari.';
   return `
       <section class="card">
-        <header class="card-head"><h2>Lembretes de pagamento</h2>${status}</header>
+        <header class="card-head"><h2>Lembretes</h2>${status}</header>
         <p class="hint" style="margin-bottom:12px">${note}</p>
         ${action ? `<div class="btn-row" style="margin-bottom:8px">${action}</div>` : ''}
         <div class="set-row"><span class="lbl">Lembrar às<small>A mesma hora em todos os dispositivos</small></span><select data-setting="remindHour">${hours}</select></div>
-        <div class="set-row"><span class="lbl">Também na véspera<small>Aviso dos pagamentos de amanhã</small></span>
+        <div class="set-row"><span class="lbl">Também na véspera<small>Aviso dos pagamentos e actividades de amanhã</small></span>
           <select data-setting="remindDayBefore"><option value="" ${st.remindDayBefore ? '' : 'selected'}>Não</option><option value="1" ${st.remindDayBefore ? 'selected' : ''}>Sim</option></select></div>
       </section>`;
 }
@@ -514,10 +514,10 @@ function mutate(fn, message) {
 const VIEWS = {
   resumo: { label: 'Resumo', icon: 'home' },
   movimentos: { label: 'Movimentos', icon: 'list' },
-  notas: { label: 'Notas', icon: 'note' },
+  notas: { label: 'Actividades', icon: 'bell' },
   balanco: { label: 'Balanço', icon: 'scale' },
 };
-const TITLES = { home: 'Projectos', settings: 'Definições', resumo: 'Resumo', movimentos: 'Movimentos', notas: 'Notas', balanco: 'Balanço' };
+const TITLES = { home: 'Projectos', settings: 'Definições', resumo: 'Resumo', movimentos: 'Movimentos', notas: 'Actividades', balanco: 'Balanço' };
 
 function renderShell() {
   $('#app').innerHTML = `
@@ -607,6 +607,26 @@ function blockedIfClosed() {
 
 /* ---------- Página inicial: escolher o projecto ---------- */
 
+/** O que há a fazer nos próximos 7 dias (ou já em atraso), em todos os projectos em curso. */
+function homeAgenda() {
+  const today = todayISO();
+  const items = S.data.projects.filter(p => !isClosed(p))
+    .flatMap(p => p.notes.filter(n => !n.done && n.remind && dayDiff(n.remind, today) <= 7).map(n => ({ n, p })))
+    .sort((a, b) => byWhen(a.n, b.n));
+  if (!items.length) return '';
+  const max = 5;
+  const row = ({ n, p }) => `
+    <button class="row-btn" data-action="open-project" data-id="${esc(p.id)}" data-view="notas">
+      <span class="row-text"><span class="row-title">${esc(n.title)}</span><span class="row-sub">${remindTag(n.remind, n.time)} ${esc(p.name)}</span></span>
+    </button>`;
+  return `
+    <section class="card">
+      <header class="card-head"><h2>Próximas actividades</h2><span class="pill">${items.length}</span></header>
+      <div class="agenda">${items.slice(0, max).map(row).join('')}</div>
+      ${items.length > max ? `<p class="hint">e mais ${items.length - max}, dentro de cada projecto</p>` : ''}
+    </section>`;
+}
+
 function projectCard(p) {
   const t = totals(p);
   const closed = isClosed(p);
@@ -641,6 +661,7 @@ function viewHome() {
   return `
     <div class="stack">
       ${installBanner()}
+      ${homeAgenda()}
       <div class="home-head">
         <div><h2>Escolha um projecto</h2><span class="hint">${open.length ? plural(open.length, 'projecto em curso', 'projectos em curso') : 'Ainda não há projectos em curso'}</span></div>
         <button class="btn btn-primary mobile-only" data-action="new-project">${ic('plus', 18)} Novo</button>
@@ -945,15 +966,18 @@ function updateSelBar() {
     ${close}`;
 }
 
-/* ---------- Notas ---------- */
+/* ---------- Actividades (no ficheiro de dados continuam a chamar-se "notes") ---------- */
 
 const notesDue = p => p.notes.filter(n => !n.done && n.remind && n.remind <= todayISO()).length;
 
-function remindTag(iso) {
+const byWhen = (a, b) => `${a.remind || '9999'} ${a.time || ''}`.localeCompare(`${b.remind || '9999'} ${b.time || ''}`);
+
+function remindTag(iso, time) {
   const diff = dayDiff(iso, todayISO());
+  const at = time ? ` · ${esc(time)}` : '';
   if (diff < 0) return `<span class="tag red">${ic('bell', 12)} Em atraso · ${dateShort(iso)}</span>`;
-  if (diff === 0) return `<span class="tag red">${ic('bell', 12)} Hoje</span>`;
-  return `<span class="tag">${ic('bell', 12)} ${diff === 1 ? 'Amanhã' : dateShort(iso)}</span>`;
+  if (diff === 0) return `<span class="tag red">${ic('bell', 12)} Hoje${at}</span>`;
+  return `<span class="tag">${ic('bell', 12)} ${diff === 1 ? 'Amanhã' : dateShort(iso)}${at}</span>`;
 }
 
 function noteRow(n) {
@@ -961,8 +985,9 @@ function noteRow(n) {
     <div class="goal note ${n.done ? 'finished' : ''}">
       <div class="goal-top">
         <button class="row-btn" data-action="edit-note" data-id="${esc(n.id)}">
-          <span class="row-text"><span class="row-title">${esc(n.title)}</span>${n.remind && !n.done ? `<span class="row-sub">${remindTag(n.remind)}</span>` : ''}</span>
+          <span class="row-text"><span class="row-title">${esc(n.title)}</span>${n.remind && !n.done ? `<span class="row-sub">${remindTag(n.remind, n.time)}</span>` : ''}</span>
         </button>
+        ${n.done ? '' : `<button class="check" data-action="note-done" data-id="${esc(n.id)}" aria-label="Marcar ${esc(n.title)} como feita">${ic('check', 15)}</button>`}
       </div>
       ${n.text ? `<p class="note-text">${esc(n.text)}</p>` : ''}
     </div>`;
@@ -970,21 +995,21 @@ function noteRow(n) {
 
 function viewNotas() {
   const { notes } = cur();
-  // Primeiro os lembretes (o mais próximo em cima), depois os mais recentes.
-  const order = (a, b) => (a.remind || '9999').localeCompare(b.remind || '9999') || (b.created || 0) - (a.created || 0);
+  // Primeiro as que têm data (a mais próxima em cima), depois as mais recentes.
+  const order = (a, b) => byWhen(a, b) || (b.created || 0) - (a.created || 0);
   const open = notes.filter(n => !n.done).sort(order);
   const done = notes.filter(n => n.done).sort((a, b) => (b.created || 0) - (a.created || 0));
   return `
     <div class="stack">
-      <div class="btn-row"><button class="btn btn-primary" data-action="new-note">${ic('plus', 18)} Nova nota</button></div>
+      <div class="btn-row"><button class="btn btn-primary" data-action="new-note">${ic('plus', 18)} Nova actividade</button></div>
       <div class="grid-2">
         <section class="card">
-          <header class="card-head"><h2>Notas</h2><span class="pill">${open.length}</span></header>
-          ${open.length ? open.map(noteRow).join('') : '<div class="empty small">O que não pode esquecer neste projecto — um contacto, o que ficou combinado, a data de uma tarefa.<br><button class="link" data-action="new-note">+ Escrever uma nota</button></div>'}
+          <header class="card-head"><h2>Por fazer</h2><span class="pill">${open.length}</span></header>
+          ${open.length ? open.map(noteRow).join('') : '<div class="empty small">O que tem de fazer neste projecto — ir a algum lado, falar com alguém, tratar de um documento.<br><button class="link" data-action="new-note">+ Adicionar uma actividade</button></div>'}
         </section>
-        ${done.length ? `<section class="card"><header class="card-head"><h2>Concluídas</h2><span class="pill">${done.length}</span></header>${done.map(noteRow).join('')}</section>` : ''}
+        ${done.length ? `<section class="card"><header class="card-head"><h2>Feitas</h2><span class="pill">${done.length}</span></header>${done.map(noteRow).join('')}</section>` : ''}
       </div>
-      <p class="hint">As notas não entram nas contas. Com uma data, o lembrete diário inclui-as.</p>
+      <p class="hint">As actividades não entram nas contas. Com uma data, entram no lembrete diário e na página inicial; com hora, têm também um aviso próprio.</p>
     </div>`;
 }
 
@@ -1533,14 +1558,18 @@ function passwordForm() {
 
 function noteForm(n) {
   const isNew = !n;
-  n = n || { title: '', text: '', remind: '', done: false };
-  openSheet(isNew ? 'Nova nota' : 'Nota', `
+  n = n || { title: '', text: '', remind: '', time: '', done: false };
+  openSheet(isNew ? 'Nova actividade' : 'Actividade', `
     <form class="form" data-form="note">
       <input type="hidden" name="id" value="${esc(n.id || '')}">
-      <label class="field"><span class="label">Título</span><input name="title" value="${esc(n.title)}" placeholder="Ex.: Combinar o tractor com o Sr. Mário" required maxlength="60" ${isNew ? 'autofocus' : ''}></label>
-      <label class="field"><span class="label">Nota</span><textarea name="text" rows="4" maxlength="2000" placeholder="O que convém lembrar">${esc(n.text)}</textarea></label>
-      <label class="field"><span class="label">Lembrar em</span><input type="date" name="remind" value="${esc(n.remind || '')}"></label>
-      ${isNew ? '' : `<button type="button" class="btn btn-block" data-action="note-done" data-id="${esc(n.id)}">${n.done ? `${ic('refresh', 18)} Reabrir` : `${ic('check', 18)} Marcar como concluída`}</button>`}
+      <label class="field"><span class="label">O que há a fazer</span><input name="title" value="${esc(n.title)}" placeholder="Ex.: Falar com o Sr. Mário sobre o tractor" required maxlength="60" ${isNew ? 'autofocus' : ''}></label>
+      <label class="field"><span class="label">Detalhes</span><textarea name="text" rows="4" maxlength="2000" placeholder="Onde, com quem, o que levar">${esc(n.text)}</textarea></label>
+      <div class="field-row">
+        <label class="field"><span class="label">Quando</span><input type="date" name="remind" value="${esc(n.remind || '')}"></label>
+        <label class="field"><span class="label">Hora <small>(opcional)</small></span><input type="time" name="time" value="${esc(n.time || '')}"></label>
+      </div>
+      <p class="hint">Com hora, recebe também um aviso entre 30 e 90 minutos antes.</p>
+      ${isNew ? '' : `<button type="button" class="btn btn-block" data-action="note-done" data-id="${esc(n.id)}">${n.done ? `${ic('refresh', 18)} Reabrir` : `${ic('check', 18)} Marcar como feita`}</button>`}
       <div class="sheet-actions">
         ${isNew ? '' : `<button type="button" class="btn btn-danger" data-action="delete-note" data-id="${esc(n.id)}">${ic('trash', 18)} Eliminar</button>`}
         <button class="btn btn-primary btn-lg">Guardar</button>
@@ -1724,7 +1753,7 @@ const ACTIONS = {
   'new-project': () => projectForm(),
   'open-project': el => {
     S.pid = el.dataset.id;
-    S.view = 'resumo';
+    S.view = el.dataset.view || 'resumo';
     S.filter = 'all';
     S.search = '';
     render();
@@ -1833,13 +1862,13 @@ const ACTIONS = {
     const id = el.dataset.id;
     const done = !cur().notes.find(x => x.id === id).done;
     closeSheet();
-    mutate(d => { proj(d).notes.find(x => x.id === id).done = done; }, done ? 'Nota concluída' : 'Nota reaberta');
+    mutate(d => { proj(d).notes.find(x => x.id === id).done = done; }, done ? 'Actividade feita' : 'Actividade reaberta');
   },
   'delete-note': el => {
     const n = cur().notes.find(x => x.id === el.dataset.id);
-    if (!confirm(`Eliminar a nota "${n.title}"?`)) return;
+    if (!confirm(`Eliminar a actividade "${n.title}"?`)) return;
     closeSheet();
-    mutate(d => { const p = proj(d); p.notes = p.notes.filter(x => x.id !== n.id); }, 'Nota eliminada');
+    mutate(d => { const p = proj(d); p.notes = p.notes.filter(x => x.id !== n.id); }, 'Actividade eliminada');
   },
   calc: calcSheet,
   'calc-key': el => calcPress(el.dataset.k),
@@ -1984,11 +2013,12 @@ const FORMS = {
 
   note(form, fd) {
     const id = fd.get('id');
-    const n = { title: fd.get('title').trim(), text: fd.get('text').trim(), remind: fd.get('remind') || null };
+    const n = { title: fd.get('title').trim(), text: fd.get('text').trim(), remind: fd.get('remind') || null, time: fd.get('time') || null };
     if (!n.title) return invalid(form, 'title');
+    if (n.time && !n.remind) return invalid(form, 'remind');
     closeSheet();
-    if (id) mutate(d => Object.assign(proj(d).notes.find(x => x.id === id), n), 'Nota guardada');
-    else mutate(d => proj(d).notes.push({ id: uid(), created: Date.now(), done: false, ...n }), 'Nota guardada');
+    if (id) mutate(d => Object.assign(proj(d).notes.find(x => x.id === id), n), 'Actividade guardada');
+    else mutate(d => proj(d).notes.push({ id: uid(), created: Date.now(), done: false, ...n }), 'Actividade guardada');
   },
 
   async password(form, fd) {
